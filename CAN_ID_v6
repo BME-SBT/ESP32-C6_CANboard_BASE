@@ -1,0 +1,137 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/twai.h"
+#include "esp_log.h"
+
+// blink 
+#define HEARTBEAT_INTERVAL_MS 500
+
+// shift‑reg
+#define PIN_SR_CLK    GPIO_NUM_4
+#define PIN_SR_DATA   GPIO_NUM_7
+#define PIN_SR_LATCH1 GPIO_NUM_5
+#define PIN_SR_LATCH2 GPIO_NUM_6
+
+#define TX_GPIO_NUM   11
+#define RX_GPIO_NUM   10
+
+static const char *TAG = "CAN_ID";
+
+// holds the 7‑seg byte (IC3) and the IC2 output byte
+static uint8_t seg_reg_state = 0xFF;
+static uint8_t out_reg_state = 0x00;
+
+#define HEARTBEAT_MASK   (1<<7)
+#define USER_LED_MASK    (1<<0)
+
+static const uint8_t SevenSegPatterns[11] = {
+    0b11000000, // 0
+    0b11111001,
+    0b10100100, 
+    0b10110000, 
+    0b10011001, 
+    0b10010010, 
+    0b10000010, 
+    0b11111000, 
+    0b10000000,
+    0b10010000, // 9
+    0b11111111  // blank
+};
+
+static void shiftOut16(uint16_t combined_value, bool latch1, bool latch2) {
+  
+    for (int i = 15; i >= 0; --i) {
+        gpio_set_level(PIN_SR_DATA, (combined_value >> i) & 1);
+        gpio_set_level(PIN_SR_CLK, 1);
+        gpio_set_level(PIN_SR_CLK, 0);
+    }
+    if (latch1) {
+        gpio_set_level(PIN_SR_LATCH1, 1);
+        gpio_set_level(PIN_SR_LATCH1, 0);
+    }
+    if (latch2) {
+        gpio_set_level(PIN_SR_LATCH2, 1);
+        gpio_set_level(PIN_SR_LATCH2, 0);
+    }
+}
+
+void SevenSegment(int number) {
+    if (number < 0 || number > 10) return;
+    // common‑anode: invert bits so LOW = ON
+    seg_reg_state = ~SevenSegPatterns[number] & 0xFF;
+    // digit update
+    uint16_t combined = ((uint16_t)seg_reg_state << 8) | out_reg_state;
+    shiftOut16(combined, /*latch1=*/false, /*latch2=*/true);
+}
+
+void setup_gpio() {
+
+    gpio_reset_pin(PIN_SR_CLK);
+    gpio_set_direction(PIN_SR_CLK, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(PIN_SR_DATA);
+    gpio_set_direction(PIN_SR_DATA, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(PIN_SR_LATCH1);
+    gpio_set_direction(PIN_SR_LATCH1, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(PIN_SR_LATCH2);
+    gpio_set_direction(PIN_SR_LATCH2, GPIO_MODE_OUTPUT);
+}
+
+void CAN_Init() {
+    twai_general_config_t g_cfg =
+        TWAI_GENERAL_CONFIG_DEFAULT(TX_GPIO_NUM, RX_GPIO_NUM, TWAI_MODE_NORMAL);
+    twai_timing_config_t t_cfg = TWAI_TIMING_CONFIG_500KBITS();
+    twai_filter_config_t f_cfg = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    if (twai_driver_install(&g_cfg, &t_cfg, &f_cfg) == ESP_OK) {
+        twai_start();
+        ESP_LOGI(TAG, "CAN initialized");
+    }
+}
+
+void app_main(void) {
+    setup_gpio();
+    CAN_Init();
+
+    SevenSegment(4); // IDE ÍROD A SZÁMOT
+
+    out_reg_state |= USER_LED_MASK;
+    {
+        uint16_t combined = ((uint16_t)seg_reg_state << 8) | out_reg_state;
+        shiftOut16(combined, /*latch1=*/true, /*latch2=*/false);
+    }
+    ESP_LOGI(TAG, "User LED D2 ON");
+
+    twai_message_t msg = {
+        .identifier = 0x101,
+        .extd = 0,
+        .rtr = 0,
+        .data_length_code = 1,
+        .data = {4} // EZT A SZÁMMAL FRISSÍTED
+    };
+
+    bool heartbeat_state = false;
+
+    while (1) {
+        heartbeat_state = !heartbeat_state;
+
+        if (heartbeat_state) {
+            // LOW on Q7 = LED ON (common‑anode)
+            seg_reg_state &= ~HEARTBEAT_MASK;
+        } else {
+            seg_reg_state |= HEARTBEAT_MASK;
+        }
+
+        // shift in new seg_reg_state & latch IC3 only
+        uint16_t combined = ((uint16_t)seg_reg_state << 8) | out_reg_state;
+        shiftOut16(combined, /*latch1=*/false, /*latch2=*/true);
+        ESP_LOGI(TAG, "Heartbeat D1 %s", heartbeat_state ? "OFF" : "ON");
+
+        if (twai_transmit(&msg, pdMS_TO_TICKS(100)) == ESP_OK) {
+            ESP_LOGI(TAG, "Sent CAN ID 4");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_INTERVAL_MS));
+    }
+}
